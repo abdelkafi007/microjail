@@ -1,66 +1,86 @@
-# Microjail 🛡️
+# Microjail
 
-A minimal, OCI-inspired Linux container runtime written from scratch in raw C. 
+A minimal, OCI-inspired Linux container runtime written from scratch in C.
 
-`microjail` was built to demonstrate deep operating system literacy, kernel boundary security, and low-level Linux systems programming. It spawns a process and completely isolates it from the host machine using standard Linux kernel APIs, acting similarly to low-level runtimes like `runc` or `crun`.
+Microjail spawns an arbitrary process and isolates it from the host machine using four core Linux kernel mechanisms: namespaces, filesystem jailing via `pivot_root`, cgroups v2 resource limits, and a seccomp-BPF syscall firewall. It mirrors the fundamental architecture of production runtimes like `runc` and `crun`.
 
-## 🏗️ Core Architecture
+## Architecture
 
-This runtime implements the four fundamental pillars of Linux containerization:
+### Namespace Virtualization
 
-1. **Namespace Virtualization (`clone`)**
-   - **UTS Namespace:** Isolates system identifiers (hostname).
-   - **PID Namespace:** Isolates the process tree (the container shell runs as `PID 1`).
-   - **Mount Namespace:** Provides a private mount table to prevent host filesystem corruption.
+The child process is spawned via the `clone()` syscall with the following namespace flags:
 
-2. **Filesystem Jailing (`pivot_root`)**
-   - securely swaps the root filesystem to a minimal Alpine Linux rootfs.
-   - Detaches and safely unmounts the host machine's root directory, preventing directory traversal or escape.
+- `CLONE_NEWUTS` — Isolates system identifiers. The container operates with its own hostname, independent of the host.
+- `CLONE_NEWPID` — Isolates the process ID number space. The container's first process runs as PID 1 and cannot observe or signal host processes.
+- `CLONE_NEWNS` — Provides a private mount table. All mount and unmount operations inside the container are invisible to the host.
 
-3. **Resource Throttling (cgroups v2)**
-   - Programmatically interacts with `/sys/fs/cgroup`.
-   - Enforces a strict `pids.max` limit to protect the host machine from malicious fork-bombs (`:(){ :|:& };:`).
+### Filesystem Jailing (pivot_root)
 
-4. **Security & Privilege Dropping**
-   - **Linux Capabilities:** Aggressively wipes the Capability Bounding Set (`PR_CAPBSET_DROP`) and active sets using `libcap`, stripping the container's `root` user of all administrative privileges.
-   - **Seccomp-BPF:** Implements a strict system call firewall via `libseccomp` to filter malicious syscalls, reducing the kernel attack surface (e.g., blocking `mkdir`, `chroot`, etc.).
+The container's root filesystem is swapped to a minimal Alpine Linux rootfs using `pivot_root(2)`. The host's original root is temporarily stashed in a subdirectory, then immediately unmounted via `umount2()` with `MNT_DETACH` and removed. After this sequence, no path from within the container can reach the host filesystem.
 
-## 🚀 How to Build & Run
+A fresh `procfs` is mounted at `/proc` inside the new root so that utilities like `ps` function correctly under the isolated PID namespace.
 
-### Prerequisites
-You must be running a modern Linux distribution with `cgroups v2` enabled. You also need the C compiler and the development libraries for `libcap` and `libseccomp`.
+### Resource Throttling (cgroups v2)
 
-**Fedora/RHEL:**
-```bash
+The runtime programmatically creates a cgroup at `/sys/fs/cgroup/microjail/` and writes the container's PID into `cgroup.procs`. Resource limits are enforced by writing to the corresponding control files:
+
+- `pids.max` — Caps the maximum number of processes the container can spawn, providing direct mitigation against fork-bomb attacks.
+
+### Security and Privilege Restriction
+
+**Capability Bounding Set:** Before executing the user payload, the runtime iterates over all 64 capability indices and calls `prctl(PR_CAPBSET_DROP, ...)` to permanently clear the bounding set. It then constructs an empty capability state via `libcap` and applies it with `cap_set_proc()`. This prevents the kernel from restoring privileges across `execve()` boundaries, even for UID 0.
+
+**Seccomp-BPF:** A BPF filter is compiled and loaded into the kernel via `libseccomp`. The default policy is set to `SCMP_ACT_ALLOW`, with explicit `SCMP_ACT_KILL` rules for dangerous syscalls (e.g., `mkdir`). Any violation results in immediate process termination via `SIGSYS`.
+
+## Build
+
+### Dependencies
+
+Fedora / RHEL:
+```
 sudo dnf install gcc libcap-devel libseccomp-devel
 ```
 
-**Ubuntu/Debian:**
-```bash
-sudo apt update
+Ubuntu / Debian:
+```
 sudo apt install gcc libcap-dev libseccomp-dev
 ```
 
-### Setup the Rootfs
-Download a minimal Alpine Linux root filesystem to act as the container's environment:
-```bash
+### Rootfs Setup
+
+Download and extract a minimal Alpine Linux root filesystem:
+```
 mkdir rootfs
 wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.0-x86_64.tar.gz
 tar -xzf alpine-minirootfs-*.tar.gz -C rootfs
 ```
 
 ### Compile
-Compile the C program and link the security libraries:
-```bash
+
+```
 gcc microjail.c -o microjail -lcap -lseccomp
 ```
 
-### Execute
-Because creating namespaces and manipulating cgroups requires host privileges, the runtime must be executed with `sudo`.
-```bash
+### Run
+
+Creating namespaces and writing to cgroup control files requires root privileges:
+```
 sudo ./microjail
 ```
-*Once spawned, you will be dropped into an isolated `/#` shell where you can verify the namespace limits, try to run a fork-bomb, or test the Seccomp firewall.*
 
-## 🧠 Educational Purpose
-This project is an educational proof-of-concept designed to map the exact syscalls and kernel mechanisms used by Docker and Kubernetes. It is not intended for production workloads.
+## Verification
+
+From inside the container shell:
+
+| Command | Expected Result |
+|---|---|
+| `hostname` | Prints `container`, not the host hostname |
+| `ps` | Shows only the container's own processes, with the shell as PID 1 |
+| `ls /` | Shows the Alpine rootfs only; host directories are not visible |
+| `hostname hacked` | Denied with `Operation not permitted` (capabilities dropped) |
+| `mkdir test` | Terminated with `Bad system call` (seccomp filter) |
+| `:()\{ :\|:& \};:` | Fork-bomb hits `pids.max` ceiling and fails safely |
+
+## Disclaimer
+
+This project is an educational proof-of-concept. It is not intended for production use.
