@@ -1,0 +1,9 @@
+# Compiled binary
+microjail
+
+# Extracted Alpine root filesystem
+rootfs/
+
+# Downloaded archives
+*.tar.gz
+*.tar.xz
